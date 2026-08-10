@@ -108,7 +108,6 @@ input[type=range]{flex:1;accent-color:var(--signal)}
   <button id="btnScan" class="primary" aria-pressed="false">Start scan</button>
   <button id="btnDemo" aria-pressed="false">Demo mode</button>
   <button id="btnCompass">Enable compass</button>
-  <button id="btnSound" aria-pressed="false">Enable sound</button>
   <button id="btnReset">Clear sweep</button>
 </div>
 
@@ -158,10 +157,7 @@ const S = {
   keep: 20,
   selected: null,
   scan: null,
-  demoT: 0,
-  sound: false,
-  audioCtx: null,
-  nextBeepAt: 0
+  demoT: 0
 };
 const BUCKETS = 36;                 // 10 degrees each
 const $ = id => document.getElementById(id);
@@ -266,7 +262,7 @@ async function startScan(){
     msg("This browser has no Web Bluetooth. On iPhone/iPad use the Bluefy browser; on Android or desktop use Chrome or Edge. Demo mode works everywhere.");
     return;
   }
-  if (typeof navigator.bluetooth.requestLEScan === "function"){
+  if (navigator.bluetooth.requestLEScan){
     try{
       S.scan = await navigator.bluetooth.requestLEScan({ acceptAllAdvertisements:true, keepRepeatedDevices:true });
       navigator.bluetooth.addEventListener("advertisementreceived", advHandler);
@@ -275,22 +271,12 @@ async function startScan(){
       return;
     }catch(err){
       msg("Continuous scan refused: " + err.message +
-          " — enable chrome://flags/#enable-experimental-web-platform-features, then fully quit and reopen the browser (not just reload). Falling back to picking one device.");
+          " — turn on chrome://flags/#enable-experimental-web-platform-features, then reload. Falling back to picking one device.");
     }
-  } else {
-    msg("requestLEScan isn't available in this browser build — enable chrome://flags/#enable-experimental-web-platform-features and fully restart the browser. Falling back to picking one device.");
   }
   // fallback: chooser + per-device advertisements
   try{
     const dev = await navigator.bluetooth.requestDevice({ acceptAllDevices:true });
-    if (typeof dev.watchAdvertisements !== "function"){
-      msg("This browser can pick a device but can't watch its advertisements — " +
-          "watchAdvertisements isn't exposed here. On a Mac: enable chrome://flags/#enable-experimental-web-platform-features, " +
-          "then fully quit Chrome (\u2318Q) and reopen it, not just reload the tab. If it's still missing after that, " +
-          "this is a known gap in Chromium's macOS Bluetooth backend — Windows, Linux, ChromeOS, and Android support it far more reliably. " +
-          "Demo mode works regardless.", "info");
-      return;
-    }
     await dev.watchAdvertisements();
     dev.addEventListener("advertisementreceived", advHandler);
     setMode("live");
@@ -467,56 +453,6 @@ function renderList(){
 }
 const esc = s => String(s).replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 
-/* ============ audio ============ */
-function initAudio(){
-  if (!S.audioCtx){
-    try{ S.audioCtx = new (window.AudioContext||window.webkitAudioContext)(); }
-    catch(err){ msg("Web Audio unavailable: " + err.message); return; }
-  }
-  if (S.audioCtx.state === "suspended") S.audioCtx.resume();
-}
-function beepTarget(){
-  if (S.selected && S.devices.has(S.selected)) return S.devices.get(S.selected);
-  const list = visible();
-  return list.length ? list[0] : null;
-}
-function playBeep(d, distM){
-  const ctx = S.audioCtx;
-  if (!ctx) return;
-  const est = estimateBearing(d);
-  let pan = 0;
-  if (est && S.headingOk){
-    const rel = ((est.bearing - S.heading + 540) % 360) - 180;   // -180..180 relative to where you're facing
-    pan = Math.max(-1, Math.min(1, rel/90));
-  }
-  const freq = Math.max(480, 1700 - Math.min(1200, distM*35));   // closer = higher pitch
-  const osc = ctx.createOscillator(), gain = ctx.createGain();
-  osc.type = "sine"; osc.frequency.value = freq;
-  const t = ctx.currentTime;
-  gain.gain.setValueAtTime(0.0001, t);
-  gain.gain.exponentialRampToValueAtTime(0.32, t+0.008);
-  gain.gain.exponentialRampToValueAtTime(0.0001, t+0.10);
-  osc.connect(gain);
-  if (ctx.createStereoPanner){
-    const p = ctx.createStereoPanner(); p.pan.value = pan;
-    gain.connect(p); p.connect(ctx.destination);
-  } else {
-    gain.connect(ctx.destination);
-  }
-  osc.start(t); osc.stop(t+0.12);
-}
-function audioTick(now){
-  if (!S.sound || !S.audioCtx) return;
-  const d = beepTarget();
-  if (!d || d.ema===null) return;
-  const distM = dist(d.ema);
-  const interval = Math.max(130, Math.min(1500, 130 + distM*32));
-  if (now >= S.nextBeepAt){
-    playBeep(d, distM);
-    S.nextBeepAt = now + interval;
-  }
-}
-
 /* ============ chrome ============ */
 function msg(t, kind){
   const d = document.createElement("div");
@@ -547,16 +483,6 @@ $("btnDemo").onclick = ()=>{
          msg("Demo mode: four imaginary devices, simulated body shadowing and noise. Nothing here is a real signal.","info"); }
 };
 $("btnCompass").onclick = enableCompass;
-$("btnSound").onclick = ()=>{
-  S.sound = !S.sound;
-  $("btnSound").setAttribute("aria-pressed", S.sound);
-  $("btnSound").textContent = S.sound ? "Mute sound" : "Enable sound";
-  if (S.sound){
-    initAudio();
-    S.nextBeepAt = 0;
-    msg("Sound on. Faster beeps = closer. Pans left/right toward the selected device — use headphones for that part to actually make sense.", "info");
-  }
-};
 $("btnReset").onclick = ()=>{ for (const d of S.devices.values()) d.buckets.fill(null); };
 
 $("pn").oninput = e => { S.n = +e.target.value; $("pnv").textContent = S.n.toFixed(1); };
@@ -565,9 +491,7 @@ $("keep").oninput = e => { S.keep = +e.target.value; $("keepv").textContent = S.
 
 $("foot").textContent =
   "Direction is inferred from how signal strength changes as you turn — your own body shadows the radio. " +
-  "It needs a slow full turn and it will not work through walls. Distance is a rough estimate from signal strength, not a measurement. " +
-  "Sound (optional) beeps faster as you get closer and pans toward the device's bearing once one is known — " +
-  "it tracks the selected device, or the strongest one if none is selected.";
+  "It needs a slow full turn and it will not work through walls. Distance is a rough estimate from signal strength, not a measurement.";
 
 /* ============ loop ============ */
 sizeCanvas();
@@ -576,7 +500,6 @@ let lastList = 0;
   demoTick();
   prune();
   draw();
-  audioTick(t);
   if (t - lastList > 400){ renderList(); lastList = t; }
   requestAnimationFrame(loop);
 })(0);
